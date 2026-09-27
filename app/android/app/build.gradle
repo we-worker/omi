@@ -168,7 +168,7 @@ dependencies {
     implementation 'androidx.room:room-runtime:2.7.2'
     implementation 'androidx.room:room-ktx:2.7.2'
     implementation 'androidx.work:work-runtime-ktx:2.10.2'
-    implementation 'com.k2fsa.sherpa.onnx:sherpa-onnx:1.13.8'
+    implementation 'com.k2fsa.sherpa.onnx:sherpa-onnx-android:1.13.8'
     ksp 'androidx.room:room-compiler:2.7.2'
 }
 
