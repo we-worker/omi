@@ -394,7 +394,7 @@ jobs:
           CM_KEY_PASSWORD: android
         # arm64-only since c8f35061fc: extra ABIs OOM'd ubuntu-latest during
         # stripDebugSymbols. Does not compile the JNI opus shim for armeabi-v7a or x86_64.
-        run: flutter build apk --debug --flavor dev --target-platform android-arm64
+        run: flutter build apk --debug --flavor dev --target-platform android-arm64 --dart-define=OMI_DEV_BYPASS_AUTH=true
 
       # --analyze-size is release-mode + single-ABI only and would be a second
       # ~10-15 min compile. Debug is not Play download size; this is a coarse
