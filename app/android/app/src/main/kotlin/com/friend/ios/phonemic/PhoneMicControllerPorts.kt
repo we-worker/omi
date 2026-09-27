@@ -1,5 +1,10 @@
 package com.friend.ios.phonemic
 
+import com.friend.ios.phonemic.alwayson.PhoneMicVadGate
+import com.friend.ios.phonemic.alwayson.SherpaSileroVadGate
+import com.friend.ios.phonemic.alwayson.storage.AlwaysOnChunkRuntime
+import com.friend.ios.phonemic.alwayson.storage.PhoneMicAlwaysOnChunkSink
+
 /**
  * Narrow execution/environment ports for the phone-mic controller policy
  * (SCA-491 / C5).
@@ -108,6 +113,12 @@ class PhoneMicControllerPorts internal constructor(
     val makeEncoder: () -> PhoneMicEncoderHandle?,
     val makeWriter: (directory: String) -> PhoneMicWriterHandle,
     val log: (level: PhoneMicLogLevel, tag: String, message: String, error: Throwable?) -> Unit,
+    /** Session-scoped opt-in. Defaults false so existing Omi batch semantics are untouched. */
+    val batchVadEnabled: () -> Boolean = { false },
+    /** Creates the sherpa/Silero gate only when [batchVadEnabled] is true. */
+    val makeVadGate: () -> PhoneMicVadGate? = { null },
+    /** Creates durable speech-chunk storage + Room/WorkManager publication. */
+    val makeAlwaysOnChunkSink: () -> PhoneMicAlwaysOnChunkSink? = { null },
 ) {
     companion object {
         /** The real Android stack: Handler main loop, AudioRecord engines, mic FGS. */
@@ -197,6 +208,13 @@ class PhoneMicControllerPorts internal constructor(
                 },
                 makeEncoder = { PhoneMicOpusEncoder.create()?.let(::OpusEncoderAdapter) },
                 makeWriter = { directory -> WriterAdapter(PhoneMicBatchAudioWriter(application, directory)) },
+                batchVadEnabled = {
+                    application
+                        .getSharedPreferences("FlutterSharedPreferences", android.content.Context.MODE_PRIVATE)
+                        .getBoolean("flutter.phoneAlwaysOnVadEnabled", false)
+                },
+                makeVadGate = { SherpaSileroVadGate.create(application) },
+                makeAlwaysOnChunkSink = { AlwaysOnChunkRuntime.create(application) },
                 log = { level, tag, message, error ->
                     when (level) {
                         PhoneMicLogLevel.INFO -> android.util.Log.i(tag, message, error)

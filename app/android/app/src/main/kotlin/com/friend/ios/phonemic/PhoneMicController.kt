@@ -3,6 +3,9 @@ package com.friend.ios.phonemic
 import android.app.Application
 import android.media.AudioManager
 import android.os.Looper
+import com.friend.ios.phonemic.alwayson.PhoneMicVadGate
+import com.friend.ios.phonemic.alwayson.VadSpeechEvent
+import com.friend.ios.phonemic.alwayson.storage.PhoneMicAlwaysOnChunkSink
 
 /**
  * The phone-mic capture state machine — the Kotlin port of iOS `PhoneMicController`.
@@ -92,6 +95,13 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
     private var encoder: PhoneMicEncoderHandle? = null
     private var writer: PhoneMicWriterHandle? = null
     private var batchMarker = "omibatchphone"
+
+    // Optional low-power VAD sidecar for batch capture. It is session-scoped and only
+    // touched on PhoneMicAudio after creation. Disabled by default, so existing Omi
+    // Transcribe Later behavior remains byte-for-byte unchanged until explicitly enabled.
+    private var vadGate: PhoneMicVadGate? = null
+    private var alwaysOnChunkSink: PhoneMicAlwaysOnChunkSink? = null
+    private var vadEnabledForSession = false
 
     /** Set true on main when the mic is silenced; read on the audio queue to drop the
      * zeros a silenced AudioRecord delivers. The one and only cross-thread flag. */
@@ -202,6 +212,7 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
 
             PhoneMicCaptureState.IDLE -> {
                 this.mode = mode
+                vadEnabledForSession = mode == PhoneMicCaptureMode.BATCH && ports.batchVadEnabled()
                 currentSessionId = sessionId
                 startRetriesUsed = 0
                 pendingStop = false
@@ -211,7 +222,10 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
                 interruptionCause = Cause.NONE
                 pendingStartCallbacks.add(callback)
                 enterState(PhoneMicCaptureState.STARTING)
-                info("starting mode=${if (mode == PhoneMicCaptureMode.BATCH) "batch" else "stream"}")
+                info(
+                    "starting mode=${if (mode == PhoneMicCaptureMode.BATCH) "batch" else "stream"}" +
+                        if (vadEnabledForSession) "+vad" else "",
+                )
                 beginStartSequence()
             }
         }
@@ -261,6 +275,13 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
             if (failure != null) {
                 failStart(failure, batchFailureMessage(failure))
                 return
+            }
+            if (vadEnabledForSession) {
+                val vadFailure = ensureVadResources()
+                if (vadFailure != null) {
+                    failStart(vadFailure, batchFailureMessage(vadFailure))
+                    return
+                }
             }
         }
 
@@ -358,8 +379,13 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
         // captured refs on the audio queue.
         val w = writer
         val enc = encoder
+        val gate = vadGate
+        val chunkSink = alwaysOnChunkSink
         writer = null
         encoder = null
+        vadGate = null
+        alwaysOnChunkSink = null
+        vadEnabledForSession = false
         silenced = false
         emissionGated = false
         interruptionCause = Cause.NONE
@@ -367,9 +393,11 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
         state = PhoneMicCaptureState.IDLE
         resolvePendingStarts(Result.failure(PhoneMicPigeonError(code, message, null)))
         resolvePendingStops(Result.success(Unit)) // a stop pending during STARTING now succeeds
-        if (w != null || enc != null) {
+        if (w != null || enc != null || gate != null || chunkSink != null) {
             audioQueue.execute {
                 w?.closeNow("aborted")
+                chunkSink?.close("aborted")
+                gate?.close()
                 enc?.destroy()
             }
         }
@@ -399,12 +427,19 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
         teardownEngine()
         val w = writer
         val enc = encoder
+        val gate = vadGate
+        val chunkSink = alwaysOnChunkSink
         audioQueue.execute {
             w?.closeNow("manual")
+            chunkSink?.close("manual")
+            gate?.close()
             enc?.destroy()
             main.post {
                 writer = null
                 encoder = null
+                vadGate = null
+                alwaysOnChunkSink = null
+                vadEnabledForSession = false
                 silenced = false
                 emissionGated = false
                 ports.stopForegroundService()
@@ -437,16 +472,46 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
                 emitter.emitFrame(chunk, epoch, sessionId) // frame gate re-checked on main (iOS parity)
 
             PhoneMicCaptureMode.BATCH -> {
-                val enc = encoder ?: return
-                val w = writer ?: return
-                val packets = enc.encode(chunk)
-                if (packets.isNotEmpty()) w.append(packets, batchMarker)
+                val gate = vadGate
+                if (gate == null) {
+                    encodeAndWriteBatchPcm(chunk)
+                } else {
+                    // VAD and chunk persistence both live on PhoneMicAudio. Explicit speech
+                    // boundary events keep Opus carry + file/Room boundaries aligned.
+                    gate.acceptPcm16Le(chunk).forEach { event ->
+                        when (event) {
+                            VadSpeechEvent.SpeechStart -> alwaysOnChunkSink?.onSpeechStart()
+                            is VadSpeechEvent.SpeechPcm -> encodeAndWriteVadSpeechPcm(event.pcm16Le)
+                            VadSpeechEvent.SpeechEnd -> {
+                                alwaysOnChunkSink?.onSpeechEnd("vad")
+                                encoder?.discardPartial()
+                            }
+                        }
+                    }
+                }
                 // Deliberately NOT epoch-gated: the executor FIFO already separates epochs
-                // (teardown joins the read thread before discardPartial is enqueued, before
+                // (teardown joins the read thread before reset/discard is enqueued, before
                 // any new-epoch chunk), and dropping a late frame here would lose audio that
                 // belongs before the split.
             }
         }
+    }
+
+    private fun encodeAndWriteBatchPcm(pcm: ByteArray) {
+        val enc = encoder ?: return
+        val w = writer ?: return
+        val packets = enc.encode(pcm)
+        if (packets.isNotEmpty()) w.append(packets, batchMarker)
+    }
+
+    /** Stage 2 mirrors the same already-encoded packets into the durable local chunk store.
+     * This avoids a second Opus encode while preserving Omi's legacy batch file during
+     * migration. A formal ALWAYS_ON mode can stop the legacy mirror later. */
+    private fun encodeAndWriteVadSpeechPcm(pcm: ByteArray) {
+        val enc = encoder ?: return
+        val packets = enc.encode(pcm)
+        if (packets.isNotEmpty()) writer?.append(packets, batchMarker)
+        alwaysOnChunkSink?.appendPackets(packets)
     }
 
     // MARK: - Heartbeat (1Hz, main; both modes; cancelled at stop)
@@ -588,7 +653,11 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
         enterState(PhoneMicCaptureState.INTERRUPTED)
         if (cause == Cause.SILENCED) {
             emissionGated = true
-            audioQueue.execute { encoder?.discardPartial() } // never splice across the gap
+            audioQueue.execute {
+                alwaysOnChunkSink?.onCaptureGap()
+                vadGate?.resetForGap()
+                encoder?.discardPartial()
+            } // never splice VAD/Opus/file state across the gap
         }
         info("interrupted (cause=$cause)")
     }
@@ -703,7 +772,11 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
         emitter.generation.invalidate()
         engine?.teardown()
         engine = null
-        audioQueue.execute { encoder?.discardPartial() }
+        audioQueue.execute {
+            alwaysOnChunkSink?.onCaptureGap()
+            vadGate?.resetForGap()
+            encoder?.discardPartial()
+        }
     }
 
     // MARK: - Batch resources
@@ -721,9 +794,20 @@ class PhoneMicController private constructor(private val ports: PhoneMicControll
         return null
     }
 
+    private fun ensureVadResources(): String? {
+        if (!vadEnabledForSession) return null
+        if (vadGate == null) vadGate = ports.makeVadGate() ?: return "vad_init_failed"
+        if (alwaysOnChunkSink == null) {
+            alwaysOnChunkSink = ports.makeAlwaysOnChunkSink() ?: return "always_on_store_init_failed"
+        }
+        return null
+    }
+
     private fun batchFailureMessage(code: String): String = when (code) {
         "batch_dir_unavailable" -> "flutter.batchAudioDir is unset or empty"
         "opus_init_failed" -> "could not create the native opus encoder"
+        "vad_init_failed" -> "could not create sherpa-onnx Silero VAD (missing runtime/model asset?)"
+        "always_on_store_init_failed" -> "could not create always-on local chunk store"
         else -> code
     }
 

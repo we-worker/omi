@@ -1,7 +1,6 @@
 /*
  * JNI shim bridging Kotlin `PhoneMicOpusEncoder` to libopus for batch
- * (transcribe-later) phone-mic capture. It exposes exactly three static natives —
- * create / encode-one-frame / destroy — and never calls back into Java (no
+ * (transcribe-later) phone-mic capture. It exposes small encoder and decoder native entry points and never calls back into Java (no
  * FindClass/GetMethodID), so the default ProGuard keep rule for JNI is enough.
  *
  * Why we hand-declare the opus prototypes instead of including its headers:
@@ -40,11 +39,17 @@ typedef void *(*opus_encoder_create_fn)(int32_t sample_rate, int channels, int a
 typedef int (*opus_encode_fn)(void *st, const int16_t *pcm, int frame_size, uint8_t *data, int32_t max_data_bytes);
 typedef int (*opus_encoder_ctl_fn)(void *st, int request, ...);
 typedef void (*opus_encoder_destroy_fn)(void *st);
+typedef void *(*opus_decoder_create_fn)(int32_t sample_rate, int channels, int *error);
+typedef int (*opus_decode_fn)(void *st, const uint8_t *data, int32_t len, int16_t *pcm, int frame_size, int decode_fec);
+typedef void (*opus_decoder_destroy_fn)(void *st);
 
 static opus_encoder_create_fn p_opus_encoder_create = NULL;
 static opus_encode_fn p_opus_encode = NULL;
 static opus_encoder_ctl_fn p_opus_encoder_ctl = NULL;
 static opus_encoder_destroy_fn p_opus_encoder_destroy = NULL;
+static opus_decoder_create_fn p_opus_decoder_create = NULL;
+static opus_decode_fn p_opus_decode = NULL;
+static opus_decoder_destroy_fn p_opus_decoder_destroy = NULL;
 
 static pthread_once_t g_opus_once = PTHREAD_ONCE_INIT;
 static int g_opus_ready = 0;
@@ -68,13 +73,20 @@ static void opus_resolve(void)
     p_opus_encode = (opus_encode_fn) dlsym(lib, "opus_encode");
     p_opus_encoder_ctl = (opus_encoder_ctl_fn) dlsym(lib, "opus_encoder_ctl");
     p_opus_encoder_destroy = (opus_encoder_destroy_fn) dlsym(lib, "opus_encoder_destroy");
+    p_opus_decoder_create = (opus_decoder_create_fn) dlsym(lib, "opus_decoder_create");
+    p_opus_decode = (opus_decode_fn) dlsym(lib, "opus_decode");
+    p_opus_decoder_destroy = (opus_decoder_destroy_fn) dlsym(lib, "opus_decoder_destroy");
     if (p_opus_encoder_create == NULL || p_opus_encode == NULL || p_opus_encoder_ctl == NULL ||
-        p_opus_encoder_destroy == NULL) {
-        LOGE("dlsym failed (create=%p encode=%p ctl=%p destroy=%p)",
+        p_opus_encoder_destroy == NULL || p_opus_decoder_create == NULL || p_opus_decode == NULL ||
+        p_opus_decoder_destroy == NULL) {
+        LOGE("dlsym failed (enc_create=%p encode=%p ctl=%p enc_destroy=%p dec_create=%p decode=%p dec_destroy=%p)",
              (void *) p_opus_encoder_create,
              (void *) p_opus_encode,
              (void *) p_opus_encoder_ctl,
-             (void *) p_opus_encoder_destroy);
+             (void *) p_opus_encoder_destroy,
+             (void *) p_opus_decoder_create,
+             (void *) p_opus_decode,
+             (void *) p_opus_decoder_destroy);
         return;
     }
     g_opus_ready = 1;
@@ -154,4 +166,79 @@ JNIEXPORT void JNICALL Java_com_friend_ios_phonemic_PhoneMicOpusEncoder_nativeDe
         return;
     }
     p_opus_encoder_destroy((void *) (intptr_t) handle);
+}
+
+
+// ---------------------------------------------------------------------------
+// Always-on decoder JNI
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jlong JNICALL Java_com_friend_ios_phonemic_PhoneMicOpusDecoder_nativeCreateDecoder(JNIEnv *env,
+                                                                                              jclass clazz,
+                                                                                              jint sampleRate,
+                                                                                              jint channels)
+{
+    (void) env;
+    (void) clazz;
+    pthread_once(&g_opus_once, opus_resolve);
+    if (!g_opus_ready) {
+        return 0;
+    }
+    int err = 0;
+    void *dec = p_opus_decoder_create((int32_t) sampleRate, (int) channels, &err);
+    if (dec == NULL || err != 0) {
+        LOGE("opus_decoder_create failed (err=%d)", err);
+        return 0;
+    }
+    return (jlong) (intptr_t) dec;
+}
+
+JNIEXPORT jbyteArray JNICALL Java_com_friend_ios_phonemic_PhoneMicOpusDecoder_nativeDecodePacket(JNIEnv *env,
+                                                                                                  jclass clazz,
+                                                                                                  jlong handle,
+                                                                                                  jbyteArray packet)
+{
+    (void) clazz;
+    if (handle == 0 || packet == NULL) {
+        return NULL;
+    }
+    jsize packet_len = (*env)->GetArrayLength(env, packet);
+    if (packet_len <= 0 || packet_len > 1275) {
+        LOGE("nativeDecodePacket invalid packet size %d", (int) packet_len);
+        return NULL;
+    }
+
+    uint8_t encoded[1275];
+    (*env)->GetByteArrayRegion(env, packet, 0, packet_len, (jbyte *) encoded);
+    int16_t pcm[FRAME_SAMPLES];
+    int decoded_samples = p_opus_decode((void *) (intptr_t) handle,
+                                        encoded,
+                                        (int32_t) packet_len,
+                                        pcm,
+                                        FRAME_SAMPLES,
+                                        0);
+    if (decoded_samples <= 0 || decoded_samples > FRAME_SAMPLES) {
+        LOGE("opus_decode failed (ret=%d)", decoded_samples);
+        return NULL;
+    }
+
+    jsize bytes = (jsize) (decoded_samples * (int) sizeof(int16_t));
+    jbyteArray out = (*env)->NewByteArray(env, bytes);
+    if (out == NULL) {
+        return NULL;
+    }
+    (*env)->SetByteArrayRegion(env, out, 0, bytes, (const jbyte *) pcm);
+    return out;
+}
+
+JNIEXPORT void JNICALL Java_com_friend_ios_phonemic_PhoneMicOpusDecoder_nativeDestroyDecoder(JNIEnv *env,
+                                                                                              jclass clazz,
+                                                                                              jlong handle)
+{
+    (void) env;
+    (void) clazz;
+    if (handle == 0) {
+        return;
+    }
+    p_opus_decoder_destroy((void *) (intptr_t) handle);
 }
