@@ -20,6 +20,7 @@ import com.friend.ios.phonemic.alwayson.storage.PhoneMicAlwaysOnChunkSink
  * No policy lives in this file: signatures and production adapters only.
  */
 
+// Keep this Android source path in the mobile CI change set.
 /** Everything the controller emits toward Dart. */
 interface PhoneMicEventSink {
     fun onAudioFrame(pcm16leMono16k: ByteArray, sessionId: Long)
