@@ -679,6 +679,10 @@ class SharedPreferencesUtil {
 
   bool get vadGateEnabled => getBool('vadGateEnabled');
 
+  // Local Android phone-mic VAD uses the same developer toggle.
+  bool get phoneAlwaysOnVadEnabled => getBool('phoneAlwaysOnVadEnabled');
+  set phoneAlwaysOnVadEnabled(bool value) => saveBool('phoneAlwaysOnVadEnabled', value);
+
   // Notification frequency (0-5): 0 = off, 5 = most frequent. Default is 0 (disabled)
   set notificationFrequency(int value) => saveInt('notificationFrequency', value);
 
