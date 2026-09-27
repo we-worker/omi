@@ -291,6 +291,8 @@ class DeveloperModeProvider extends BaseProvider {
   void onVadGateChanged(bool value) {
     vadGateEnabled = value;
     SharedPreferencesUtil().vadGateEnabled = value;
+    // Keep the local Android VAD gate aligned with the server-side diagnostic toggle.
+    SharedPreferencesUtil().phoneAlwaysOnVadEnabled = value;
     notifyListeners();
   }
 
