@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'package:omi/backend/preferences.dart';
+import 'package:omi/env/env.dart';
+import 'package:omi/flavors.dart';
 import 'package:omi/pages/home/page.dart';
 import 'package:omi/pages/onboarding/device_selection.dart';
 import 'package:omi/pages/onboarding/permissions/permissions_checker.dart';
@@ -36,6 +38,9 @@ class _MobileAppState extends State<MobileApp> {
   Widget build(BuildContext context) {
     return Consumer<AuthenticationProvider>(
       builder: (context, authProvider, child) {
+        if (Env.devBypassAuth && F.env != Environment.prod) {
+          return const HomePageWrapper();
+        }
         if (authProvider.requiresReauthentication) {
           _presentSessionExpiration(authProvider.sessionExpirationGeneration);
           return const OnboardingWrapper(forceAuthPage: true);
