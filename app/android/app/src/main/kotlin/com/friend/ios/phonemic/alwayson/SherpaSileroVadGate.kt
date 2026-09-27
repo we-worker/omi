@@ -33,7 +33,9 @@ object SherpaSileroVadGate {
                 threshold = 0.5f,
                 minSilenceDuration = 0.25f,
                 minSpeechDuration = 0.25f,
-                windowSize = 512,
+                // Silero VAD 6.2.1 (the vendored op15 model) uses 256 samples at
+                // 16 kHz. 512-sample windows produce near-zero probabilities.
+                windowSize = 256,
                 maxSpeechDuration = 30.0f,
             )
             val config = VadModelConfig(
