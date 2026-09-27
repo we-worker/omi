@@ -7,6 +7,8 @@ import 'environment_profile.dart';
 abstract class Env {
   static const productionApiBaseUrl = 'https://api.omi.me/';
   static const _apiBaseUrlFromDefine = String.fromEnvironment('OMI_API_BASE_URL');
+  /// Development-only switch for hardware/UI iteration without an account.
+  static const devBypassAuth = bool.fromEnvironment('OMI_DEV_BYPASS_AUTH', defaultValue: false);
   static const firebaseAuthEmulatorHost = String.fromEnvironment(
     'OMI_FIREBASE_AUTH_EMULATOR_HOST',
     defaultValue: '127.0.0.1',
