@@ -12,6 +12,8 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'package:omi/services/account_cutover/account_cutover_gate.dart';
 import 'package:omi/services/account_cutover/account_cutover_runtime.dart';
+import 'package:omi/env/env.dart';
+import 'package:omi/flavors.dart';
 import 'package:omi/utils/l10n_extensions.dart';
 
 class AccountCutoverBlockingGate extends StatefulWidget {
@@ -76,7 +78,7 @@ class _AccountCutoverBlockingGateState extends State<AccountCutoverBlockingGate>
         final decision = runtime.decision;
         final fenceVisible = decision != AccountCutoverGateDecision.allowProductTraffic;
         _syncFenceRefreshTimer(fenceVisible);
-        if (!fenceVisible) {
+        if (!fenceVisible || (Env.devBypassAuth && F.env != Environment.prod)) {
           return widget.productBuilder?.call(context) ?? widget.child!;
         }
 
